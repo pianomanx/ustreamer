@@ -46,6 +46,7 @@
 
 #include "jlogging.h"
 #include "audio.h"
+#include "tc358743.h"
 #include "rtpv.h"
 #include "rtpa.h"
 
@@ -122,6 +123,7 @@ const useconds_t		_g_lock_polling = 1000;
 const useconds_t		_g_watchers_polling = 100000;
 
 static char				*_g_audio_dev = NULL;
+static char				*_g_tc358743_dev = NULL;
 
 static _client_s		*_g_clients = NULL;
 static janus_callbacks	*_g_gw = NULL;
@@ -150,12 +152,12 @@ static int _wait_frame(int fd, memsink_shared_s* mem, uint64_t last_id) {
 	long double deadline_ts = get_now_monotonic() + _g_wait_timeout;
 	long double now;
 	do {
-		int retval = flock_timedwait_monotonic(fd, _g_lock_timeout);
+		int result = flock_timedwait_monotonic(fd, _g_lock_timeout);
 		now = get_now_monotonic();
-		if (retval < 0 && errno != EWOULDBLOCK) {
+		if (result < 0 && errno != EWOULDBLOCK) {
 			JLOG_PERROR("video", "Can't lock memsink");
 			return -1;
-		} else if (retval == 0) {
+		} else if (result == 0) {
 			if (mem->magic == MEMSINK_MAGIC && mem->version == MEMSINK_VERSION && mem->id != last_id) {
 				return 0;
 			}
@@ -273,6 +275,7 @@ static void *_clients_audio_thread(UNUSED void *arg) {
 	A_THREAD_RENAME("us_a_clients");
 	atomic_store(&_g_audio_tid_created, true);
 	assert(_g_audio_dev);
+	assert(_g_tc358743_dev);
 
 	while (!STOP) {
 		if (!HAS_WATCHERS) {
@@ -280,16 +283,30 @@ static void *_clients_audio_thread(UNUSED void *arg) {
 			continue;
 		}
 
+		tc358743_info_s info = {0};
 		audio_s *audio = NULL;
-		if ((audio = audio_init(_g_audio_dev)) == NULL) {
+
+		if (
+			tc358743_read_info(_g_tc358743_dev, &info) < 0
+			|| !info.has_audio
+			|| (audio = audio_init(_g_audio_dev, info.audio_hz)) == NULL
+		) {
 			goto close_audio;
 		}
 
 		while (!STOP && HAS_WATCHERS) {
+			if (
+				tc358743_read_info(_g_tc358743_dev, &info) < 0
+				|| !info.has_audio
+				|| audio->pcm_hz != info.audio_hz
+			) {
+				goto close_audio;
+			}
+
 			size_t size = RTP_DATAGRAM_SIZE - RTP_HEADER_SIZE;
 			uint8_t data[size];
 			uint64_t pts;
-			int result = audio_copy_encoded(audio, data, &size, &pts);
+			int result = audio_get_encoded(audio, data, &size, &pts);
 			if (result == 0) {
 				LOCK;
 				rtpa_wrap(_g_rtpa, data, size, pts);
@@ -337,6 +354,10 @@ static int _read_config(const char *config_dir_path) {
 	}
 	if ((_g_audio_dev = _get_config_value(config, "audio", "device")) != NULL) {
 		JLOG_INFO("main", "Enabled the experimental AUDIO feature");
+		if ((_g_tc358743_dev = _get_config_value(config, "audio", "tc358743")) == NULL) {
+			JLOG_INFO("main", "Missing config value: audio.tc358743");
+			goto error;
+		}
 	}
 
 	int retval = 0;
@@ -392,25 +413,14 @@ static void _plugin_destroy(void) {
 	});
 	_g_clients = NULL;
 
-	if (_g_rtpa) {
-		rtpa_destroy(_g_rtpa);
-		_g_rtpa = NULL;
-	}
-
-	rtpv_destroy(_g_rtpv);
-	_g_rtpv = NULL;
-
+#	define DEL(_func, _var) { if (_var) { _func(_var); _var = NULL; } }
+	DEL(rtpa_destroy, _g_rtpa);
+	DEL(rtpv_destroy, _g_rtpv);
 	_g_gw = NULL;
-
-	if (_g_audio_dev) {
-		free(_g_audio_dev);
-		_g_audio_dev = NULL;
-	}
-
-	if (_g_memsink_obj) {
-		free(_g_memsink_obj);
-		_g_memsink_obj = NULL;
-	}
+	DEL(free, _g_tc358743_dev);
+	DEL(free, _g_audio_dev);
+	DEL(free, _g_memsink_obj);
+#	undef DEL
 }
 
 #define IF_DISABLED(...) { if (!READY || STOP) { __VA_ARGS__ } }
